@@ -3,6 +3,7 @@ import Foundation
 import MLX
 import MLXNN
 import MLXRandom
+import Vocos
 
 // MARK: - F5TTS
 

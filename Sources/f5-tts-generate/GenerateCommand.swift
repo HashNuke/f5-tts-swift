@@ -1,6 +1,8 @@
 import ArgumentParser
+import F5TTS
 import Foundation
 import MLX
+import Vocos
 
 struct GenerateAudio: AsyncParsableCommand {
     @Argument(help: "Text to generate speech from")
