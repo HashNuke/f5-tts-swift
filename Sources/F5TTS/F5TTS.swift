@@ -1,9 +1,8 @@
-import Foundation
 import Hub
+import Foundation
 import MLX
 import MLXNN
 import MLXRandom
-import Vocos
 
 // MARK: - F5TTS
 
@@ -74,26 +73,26 @@ public class F5TTS: Module {
         case midpoint
         case rk4
     }
-    
+
     enum F5TTSError: Error {
         case unableToLoadModel
         case unableToLoadReferenceAudio
         case unableToDetermineDuration
     }
 
-    public let melSpec: MelSpec
-    public let transformer: DiT
+    public let melSpec: F5MelSpec
+    public let transformer: F5DiT
 
     let dim: Int
     let numChannels: Int
     let vocabCharMap: [String: Int]
-    let _durationPredictor: DurationPredictor?
+    let _durationPredictor: F5DurationPredictor?
 
     init(
-        transformer: DiT,
-        melSpec: MelSpec,
+        transformer: F5DiT,
+        melSpec: F5MelSpec,
         vocabCharMap: [String: Int],
-        durationPredictor: DurationPredictor? = nil
+        durationPredictor: F5DurationPredictor? = nil
     ) {
         self.melSpec = melSpec
         self.numChannels = self.melSpec.nMels
@@ -147,21 +146,27 @@ public class F5TTS: Module {
 
         if resolvedDuration == nil, let durationPredictor = self._durationPredictor {
             let estimatedDurationInSeconds = durationPredictor(cond, text: text).item(Float32.self)
-            resolvedDuration = MLXArray(Int(Double(estimatedDurationInSeconds) * F5TTS.framesPerSecond))
+            resolvedDuration = MLXArray(
+                Int(Double(estimatedDurationInSeconds) * F5TTS.framesPerSecond))
         }
 
         guard let resolvedDuration else {
             throw F5TTSError.unableToDetermineDuration
         }
 
-        print("Generating \(Double(resolvedDuration.item(Float32.self)) / F5TTS.framesPerSecond) seconds of audio...")
+        print(
+            "Generating \(Double(resolvedDuration.item(Float32.self)) / F5TTS.framesPerSecond) seconds of audio..."
+        )
 
         var duration = resolvedDuration
         duration = MLX.clip(MLX.maximum(lens + 1, duration), min: 0, max: maxDuration)
         let maxDuration = duration.max().item(Int.self)
 
-        cond = MLX.padded(cond, widths: [.init((0, 0)), .init((0, maxDuration - condSeqLen)), .init((0, 0))])
-        condMask = MLX.padded(condMask, widths: [.init((0, 0)), .init((0, maxDuration - condMask.shape[1]))], value: MLXArray(false))
+        cond = MLX.padded(
+            cond, widths: [.init((0, 0)), .init((0, maxDuration - condSeqLen)), .init((0, 0))])
+        condMask = MLX.padded(
+            condMask, widths: [.init((0, 0)), .init((0, maxDuration - condMask.shape[1]))],
+            value: MLXArray(false))
         condMask = condMask.expandedDimensions(axis: -1)
         let stepCond = MLX.where(condMask, cond, MLX.zeros(like: cond))
 
@@ -221,11 +226,12 @@ public class F5TTS: Module {
             t = t + coef * (MLX.cos(MLXArray(.pi) / 2 * t) - 1 + t)
         }
 
-        let odeintFn = switch method {
-        case .euler: odeint_euler
-        case .midpoint: odeint_midpoint
-        case .rk4: odeint_rk4
-        }
+        let odeintFn =
+            switch method {
+            case .euler: odeint_euler
+            case .midpoint: odeint_midpoint
+            case .rk4: odeint_rk4
+            }
 
         let trajectory = odeintFn(fn, y0Padded, t)
         let sampled = trajectory[-1]
@@ -250,10 +256,19 @@ public class F5TTS: Module {
         sway: Double = -1.0,
         speed: Double = 1.0,
         seed: Int? = nil,
+        vocos: Vocos? = nil,
+        vocosDirectoryURL: URL? = nil,
         progressHandler: ((Double) -> Void)? = nil
     ) async throws -> MLXArray {
-        print("Loading Vocos model...")
-        let vocos = try await Vocos.fromPretrained(repoId: "lucasnewman/vocos-mel-24khz-mlx")
+        let vocoderModel: Vocos
+        if let vocos {
+            vocoderModel = vocos
+        } else if let vocosDirectoryURL {
+            vocoderModel = try Vocos.fromPretrained(modelDirectoryURL: vocosDirectoryURL)
+        } else {
+            print("Loading Vocos model...")
+            vocoderModel = try await Vocos.fromPretrained(repoId: "lucasnewman/vocos-mel-24khz-mlx")
+        }
 
         // load the reference audio + text
 
@@ -275,17 +290,28 @@ public class F5TTS: Module {
 
         let normalizedAudio = F5TTS.normalizeAudio(audio: audio)
         let processedText = referenceText + " " + text
+        var durationFrames: Int?
+        if let duration {
+            let clampedSeconds = max(duration, 0)
+            durationFrames = max(Int(clampedSeconds * F5TTS.framesPerSecond), 1)
+            print(
+                "Using user-provided duration of \(clampedSeconds) seconds (\(durationFrames!) frames) for generated speech."
+            )
+        } else if self._durationPredictor == nil {
+            durationFrames = F5TTS.estimatedDurationFrames(
+                refAudio: normalizedAudio, refText: referenceText, text: text, speed: speed)
+        }
 
         let (outputAudio, _) = try self.sample(
             cond: normalizedAudio.expandedDimensions(axis: 0),
             text: [processedText],
-            duration: nil,
+            duration: durationFrames,
             steps: steps,
             method: method,
             cfgStrength: cfg,
             swayCoef: sway,
             seed: seed,
-            vocoder: vocos.decode
+            vocoder: vocoderModel.decode
         ) { progress in
             print("Generation progress: \(progress)")
             progressHandler?(progress)
@@ -297,24 +323,36 @@ public class F5TTS: Module {
 
 // MARK: - Pretrained Models
 
-public extension F5TTS {
-    static func fromPretrained(repoId: String, downloadProgress: ((Progress) -> Void)? = nil) async throws -> F5TTS {
-        let modelDirectoryURL = try await Hub.snapshot(from: repoId, matching: ["*.safetensors", "*.txt"]) { progress in
+extension F5TTS {
+    public static func fromPretrained(repoId: String, downloadProgress: ((Progress) -> Void)? = nil)
+        async throws -> F5TTS
+    {
+        let modelDirectoryURL = try await Hub.snapshot(
+            from: repoId, matching: ["*.safetensors", "*.txt"]
+        ) { progress in
             downloadProgress?(progress)
         }
         return try self.fromPretrained(modelDirectoryURL: modelDirectoryURL)
     }
 
-    static func fromPretrained(modelDirectoryURL: URL) throws -> F5TTS {
+    public static func fromPretrained(modelDirectoryURL: URL) throws -> F5TTS {
         let modelURL = modelDirectoryURL.appendingPathComponent("model.safetensors")
-        let modelWeights = try loadArrays(url: modelURL)
+        var modelWeights = try loadArrays(url: modelURL)
+        modelWeights.removeValue(forKey: "melSpec.filterbank")
 
         // mel spec
 
-        guard let filterbankURL = Bundle.module.url(forResource: "mel_filters", withExtension: "npy") else {
+        let filterbankURL =
+            Bundle.module.url(forResource: "mel_filters", withExtension: "npy")
+            ?? URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .appendingPathComponent("Resources/mel_filters.npy")
+
+        guard FileManager.default.fileExists(atPath: filterbankURL.path) else {
             throw F5TTSError.unableToLoadModel
         }
         let filterbank = try MLX.loadArray(url: filterbankURL)
+        modelWeights["melSpec.filterbank"] = filterbank
 
         // vocab
 
@@ -328,12 +366,12 @@ public extension F5TTS {
 
         // duration model
 
-        var durationPredictor: DurationPredictor?
+        var durationPredictor: F5DurationPredictor?
         let durationModelURL = modelDirectoryURL.appendingPathComponent("duration_v2.safetensors")
         do {
-            let durationModelWeights = try loadArrays(url: durationModelURL)
+            var durationModelWeights = try loadArrays(url: durationModelURL)
 
-            let durationTransformer = DurationTransformer(
+            let durationTransformer = F5DurationTransformer(
                 dim: 512,
                 depth: 8,
                 heads: 8,
@@ -343,12 +381,19 @@ public extension F5TTS {
                 textDim: 512,
                 convLayers: 2
             )
-            let predictor = DurationPredictor(
+            durationModelWeights["melSpec.filterbank"] = filterbank
+            if let freqs = durationTransformer.text_embed.freqsCis {
+                durationModelWeights["transformer.text_embed.freqsCis"] = freqs
+            }
+            let predictor = F5DurationPredictor(
                 transformer: durationTransformer,
-                melSpec: MelSpec(filterbank: filterbank),
+                melSpec: F5MelSpec(filterbank: filterbank),
                 vocabCharMap: vocab
             )
-            try predictor.update(parameters: ModuleParameters.unflattened(durationModelWeights), verify: [.all])
+            try predictor.update(
+                parameters: ModuleParameters.unflattened(durationModelWeights),
+                verify: [VerifyUpdate.all]
+            )
 
             durationPredictor = predictor
         } catch {
@@ -357,7 +402,7 @@ public extension F5TTS {
 
         // model
 
-        let dit = DiT(
+        let dit = F5DiT(
             dim: 1024,
             depth: 22,
             heads: 16,
@@ -368,11 +413,18 @@ public extension F5TTS {
         )
         let f5tts = F5TTS(
             transformer: dit,
-            melSpec: MelSpec(filterbank: filterbank),
+            melSpec: F5MelSpec(filterbank: filterbank),
             vocabCharMap: vocab,
             durationPredictor: durationPredictor
         )
-        try f5tts.update(parameters: ModuleParameters.unflattened(modelWeights), verify: [.all])
+
+        if let freqs = f5tts.transformer.text_embed.freqsCis {
+            modelWeights["transformer.text_embed.freqsCis"] = freqs
+        }
+        if let durationPredictor, let freqs = durationPredictor.transformer.text_embed.freqsCis {
+            modelWeights["durationPredictor.transformer.text_embed.freqsCis"] = freqs
+        }
+        try f5tts.update(parameters: ModuleParameters.unflattened(modelWeights), verify: [VerifyUpdate.all])
 
         return f5tts
     }
@@ -380,17 +432,18 @@ public extension F5TTS {
 
 // MARK: - Utilities
 
-public extension F5TTS {
-    static var sampleRate: Int = 24000
-    static var hopLength: Int = 256
-    static var framesPerSecond: Double = .init(sampleRate) / Double(hopLength)
+extension F5TTS {
+    public static let sampleRate: Int = 24000
+    public static let hopLength: Int = 256
+    public static let framesPerSecond: Double = .init(sampleRate) / Double(hopLength)
 
-    static func loadAudioArray(url: URL) throws -> MLXArray {
+    public static func loadAudioArray(url: URL) throws -> MLXArray {
         try AudioUtilities.loadAudioFile(url: url)
     }
 
-    static func referenceAudio() throws -> (MLXArray, String) {
-        guard let url = Bundle.module.url(forResource: "test_en_1_ref_short", withExtension: "wav") else {
+    public static func referenceAudio() throws -> (MLXArray, String) {
+        guard let url = Bundle.module.url(forResource: "test_en_1_ref_short", withExtension: "wav")
+        else {
             throw F5TTSError.unableToLoadReferenceAudio
         }
 
@@ -400,7 +453,7 @@ public extension F5TTS {
         )
     }
 
-    static func normalizeAudio(audio: MLXArray, targetRMS: Double = 0.1) -> MLXArray {
+    public static func normalizeAudio(audio: MLXArray, targetRMS: Double = 0.1) -> MLXArray {
         let rms = Double(audio.square().mean().sqrt().item(Float.self))
         if rms < targetRMS {
             return audio * targetRMS / rms
@@ -408,19 +461,23 @@ public extension F5TTS {
         return audio
     }
 
-    static func estimatedDuration(refAudio: MLXArray, refText: String, text: String, speed: Double = 1.0) -> TimeInterval {
+    public static func estimatedDurationFrames(
+        refAudio: MLXArray, refText: String, text: String, speed: Double = 1.0
+    ) -> Int {
         let refDurationInFrames = refAudio.shape[0] / self.hopLength
-        let refTextLength = refText.utf8.count
+        var refTextForDuration = refText
+        if let last = refTextForDuration.last, last.isASCII {
+            refTextForDuration.append(" ")
+        }
+        let refTextLength = max(refTextForDuration.utf8.count, 1)
         let genTextLength = text.utf8.count
-
-        let refAudioToTextRatio = Double(refDurationInFrames) / Double(refTextLength)
-        let textLength = Double(genTextLength) / speed
-        let estimatedDurationInFrames = Int(refAudioToTextRatio * textLength)
-
-        let estimatedDuration = TimeInterval(estimatedDurationInFrames) / Self.framesPerSecond
-        print("Using duration of \(estimatedDuration) seconds (\(estimatedDurationInFrames) frames) for generated speech.")
-
-        return estimatedDuration
+        let localSpeed = genTextLength < 10 ? 0.3 : speed
+        let durationEstimate = refDurationInFrames
+            + Int(Double(refDurationInFrames) / Double(refTextLength) * Double(genTextLength) / max(localSpeed, 1e-6))
+        let clamped = max(durationEstimate, refDurationInFrames + 1)
+        let estimatedSeconds = TimeInterval(clamped) / Self.framesPerSecond
+        print("Using duration of \(estimatedSeconds) seconds (\(clamped) frames) for generated speech.")
+        return clamped
     }
 }
 
@@ -448,9 +505,12 @@ func padToLength(_ t: MLXArray, length: Int, value: Float? = nil) -> MLXArray {
     case 1:
         padded = MLX.padded(t, widths: [.init((0, length - seqLen))], value: paddingValue)
     case 2:
-        padded = MLX.padded(t, widths: [.init((0, 0)), .init((0, length - seqLen))], value: paddingValue)
+        padded = MLX.padded(
+            t, widths: [.init((0, 0)), .init((0, length - seqLen))], value: paddingValue)
     case 3:
-        padded = MLX.padded(t, widths: [.init((0, 0)), .init((0, length - seqLen)), .init((0, 0))], value: paddingValue)
+        padded = MLX.padded(
+            t, widths: [.init((0, 0)), .init((0, length - seqLen)), .init((0, 0))],
+            value: paddingValue)
     default:
         fatalError("Unsupported padding dims: \(ndim)")
     }
@@ -464,8 +524,11 @@ func padSequence(_ t: [MLXArray], paddingValue: Float = 0) -> MLXArray {
     return padToLength(t, length: maxLen, value: paddingValue)
 }
 
-func listStrToIdx(_ text: [String], vocabCharMap: [String: Int], paddingValue: Int = -1) -> MLXArray {
-    let listIdxTensors = text.map { str in str.map { char in vocabCharMap[String(char), default: 0] }}
+func listStrToIdx(_ text: [String], vocabCharMap: [String: Int], paddingValue: Int = -1) -> MLXArray
+{
+    let listIdxTensors = text.map { str in
+        str.map { char in vocabCharMap[String(char), default: 0] }
+    }
     let mlxArrays = listIdxTensors.map { MLXArray($0) }
     let paddedText = padSequence(mlxArrays, paddingValue: Float(paddingValue))
     return paddedText.asType(.int32)
