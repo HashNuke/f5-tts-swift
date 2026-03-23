@@ -7,6 +7,26 @@ import Vocos
 
 // MARK: - F5TTS
 
+enum F5Assets {
+    static func resourceURL(
+        forResource name: String,
+        withExtension ext: String,
+        assetsDirectoryURL: URL?
+    ) -> URL?
+    {
+        if let assetsDirectoryURL {
+            let resourceURL = assetsDirectoryURL.appendingPathComponent("\(name).\(ext)")
+            return FileManager.default.fileExists(atPath: resourceURL.path) ? resourceURL : nil
+        }
+
+        #if SWIFT_PACKAGE
+        return Bundle.module.url(forResource: name, withExtension: ext)
+        #else
+        return nil
+        #endif
+    }
+}
+
 func odeint_euler(fun: (Float, MLXArray) -> MLXArray, y0: MLXArray, t: MLXArray) -> MLXArray {
     var ys = [y0]
     var yCurrent = y0
@@ -88,12 +108,14 @@ public class F5TTS: Module {
     let numChannels: Int
     let vocabCharMap: [String: Int]
     let _durationPredictor: F5DurationPredictor?
+    let assetsDirectoryURL: URL?
 
     init(
         transformer: F5DiT,
         melSpec: F5MelSpec,
         vocabCharMap: [String: Int],
-        durationPredictor: F5DurationPredictor? = nil
+        durationPredictor: F5DurationPredictor? = nil,
+        assetsDirectoryURL: URL? = nil
     ) {
         self.melSpec = melSpec
         self.numChannels = self.melSpec.nMels
@@ -101,6 +123,7 @@ public class F5TTS: Module {
         self.dim = transformer.dim
         self.vocabCharMap = vocabCharMap
         self._durationPredictor = durationPredictor
+        self.assetsDirectoryURL = assetsDirectoryURL
 
         super.init()
     }
@@ -280,7 +303,7 @@ public class F5TTS: Module {
             audio = try F5TTS.loadAudioArray(url: referenceAudioURL)
             referenceText = referenceAudioText ?? ""
         } else {
-            let refAudioAndCaption = try F5TTS.referenceAudio()
+            let refAudioAndCaption = try F5TTS.referenceAudio(assetsDirectoryURL: assetsDirectoryURL)
             (audio, referenceText) = refAudioAndCaption
         }
 
@@ -336,7 +359,10 @@ extension F5TTS {
         return try self.fromPretrained(modelDirectoryURL: modelDirectoryURL)
     }
 
-    public static func fromPretrained(modelDirectoryURL: URL) throws -> F5TTS {
+    public static func fromPretrained(
+        modelDirectoryURL: URL,
+        assetsDirectoryURL: URL? = nil
+    ) throws -> F5TTS {
         let modelURL = modelDirectoryURL.appendingPathComponent("model.safetensors")
         var modelWeights = try loadArrays(url: modelURL)
         modelWeights.removeValue(forKey: "melSpec.filterbank")
@@ -344,7 +370,11 @@ extension F5TTS {
         // mel spec
 
         let filterbankURL =
-            Bundle.module.url(forResource: "mel_filters", withExtension: "npy")
+            F5Assets.resourceURL(
+                forResource: "mel_filters",
+                withExtension: "npy",
+                assetsDirectoryURL: assetsDirectoryURL
+            )
             ?? URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .appendingPathComponent("Resources/mel_filters.npy")
@@ -416,7 +446,8 @@ extension F5TTS {
             transformer: dit,
             melSpec: F5MelSpec(filterbank: filterbank),
             vocabCharMap: vocab,
-            durationPredictor: durationPredictor
+            durationPredictor: durationPredictor,
+            assetsDirectoryURL: assetsDirectoryURL
         )
 
         if let freqs = f5tts.transformer.text_embed.freqsCis {
@@ -442,8 +473,12 @@ extension F5TTS {
         try AudioUtilities.loadAudioFile(url: url)
     }
 
-    public static func referenceAudio() throws -> (MLXArray, String) {
-        guard let url = Bundle.module.url(forResource: "test_en_1_ref_short", withExtension: "wav")
+    public static func referenceAudio(assetsDirectoryURL: URL? = nil) throws -> (MLXArray, String) {
+        guard let url = F5Assets.resourceURL(
+            forResource: "test_en_1_ref_short",
+            withExtension: "wav",
+            assetsDirectoryURL: assetsDirectoryURL
+        )
         else {
             throw F5TTSError.unableToLoadReferenceAudio
         }
