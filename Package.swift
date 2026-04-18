@@ -14,7 +14,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.18.0"),
-        .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.1.6"),
+        .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.2.1"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
         .package(url: "https://github.com/HashNuke/vocos-swift", branch: "zxc")
     ],
